@@ -13,6 +13,11 @@ POST   /api/applications/batch-approve   atomic group approval (expected rev.)
 POST   /api/applications/{id}/suspend    temporary outage: leave effective set
 POST   /api/applications/{id}/resume     re-adjudicate and restore the license
 POST   /api/applications/{id}/revoke     revoke (changes future effective set)
+POST   /api/applications/{id}/waitlist   register a pending app as a standby
+POST   /api/applications/{id}/waitlist/cancel
+                                         withdraw a standby (no revision used)
+GET    /api/waitlist                     the FIFO standby queue
+GET    /api/applications/{id}/waitlist   one standby position
 GET    /api/revision/current             current revision + effective set
 GET    /api/revision/{revision}          as-of snapshot (all event types)
 GET    /api/config/guard-band            live guard band + current revision
@@ -53,6 +58,22 @@ live value; each confirmed change is appended as an immutable
 ``guard_band_events`` record so historical revision snapshots restore the
 band in force at the time.  Approval and resumption events keep their own
 copy of the band they were decided under and are never rewritten.
+
+Waitlist
+--------
+A pending application may be registered as a standby while the band is
+busy.  Registration and cancellation consume no revision and never change
+the application's status; an application is queued at most once.  When a
+suspension or a revoke releases an effective license, the same transaction
+drains the queue in registration order: each entry is re-adjudicated under
+the live guard band against the licenses effective so far (including the
+automatic approvals just granted), passers are approved immediately and
+consume the following consecutive revisions, blockers keep their place and
+the drain continues.  A manual approval removes the queue entry first, so
+a manually decided application is never auto-approved.  Every automatic
+approval is an ordinary ``ApprovalEvent`` flagged ``auto_approved`` with the
+release revision, which lets revision snapshots restore the automatic
+decisions one revision at a time.
 """
 from __future__ import annotations
 
@@ -79,6 +100,7 @@ from .models import (
     RevisionMeta,
     RevocationEvent,
     SuspensionEvent,
+    WaitlistEntry,
 )
 from .schemas import (
     ApplicationCreate,
@@ -90,6 +112,7 @@ from .schemas import (
     ResumptionRequest,
     RevocationRequest,
     SuspensionRequest,
+    WaitlistRegistrationRequest,
 )
 from .semantic_validation import (
     validate_application,
@@ -111,6 +134,8 @@ E_REVISION_OUT_OF_RANGE = "revision_out_of_range"
 E_STALE_REVISION = "stale_revision"
 E_INTERFERENCE = "interference"
 E_DUPLICATE_APPLICATION = "duplicate_application_id"
+E_ALREADY_WAITLISTED = "already_waitlisted"
+E_NOT_WAITLISTED = "not_waitlisted"
 
 
 # --------------------------------------------------------------------------- #
@@ -237,6 +262,119 @@ def load_effective_licenses(session) -> list[License]:
 
 
 # --------------------------------------------------------------------------- #
+# Waitlist (standby queue for pending applications while the band is busy)
+# --------------------------------------------------------------------------- #
+def serialize_waitlist_entry(
+    session, entry: WaitlistEntry, position: int
+) -> dict[str, Any]:
+    """Public shape of one queue position; the application stays ``pending``."""
+    app = session.get(Application, entry.application_id)
+    return {
+        "position": position,
+        "application_id": entry.application_id,
+        "reason": entry.reason,
+        "registered_at": iso(entry.created_at),
+        "application": serialize_application(app) if app else None,
+    }
+
+
+def load_waitlist(session) -> list[WaitlistEntry]:
+    """The current standby queue in registration (FIFO) order."""
+    return (
+        session.query(WaitlistEntry)
+        .order_by(WaitlistEntry.id)
+        .all()
+    )
+
+
+def drain_waitlist(
+    session,
+    meta: RevisionMeta,
+    release_revision: int,
+) -> dict[str, Any]:
+    """Re-adjudicate the standby queue after an effective license was released.
+
+    Runs inside the suspend/revoke transaction, after that operation has
+    already consumed its single revision (``release_revision``).  Entries are
+    visited strictly in registration order and re-adjudicated against the
+    current guard band and the licenses effective *so far*:
+
+    * an entry with no conflicts is approved immediately, consumes the next
+      consecutive revision, leaves the queue and joins the effective set, so
+      later entries are also checked against it;
+    * an entry that still interferes keeps its place in the queue and the
+      drain continues with the following entries.
+
+    Manually approved applications have had their queue entries removed by
+    the approve/batch handlers, so a queued application is never
+    auto-approved twice.  Returns the structured result embedded in the
+    suspend/revoke response; every created event is a normal
+    ``ApprovalEvent`` flagged ``auto_approved`` with ``release_revision`` so
+    historical revision snapshots restore the automatic decisions.
+    """
+    guard_band = meta.guard_band
+    effective = load_effective_licenses(session)
+
+    approved: list[dict[str, Any]] = []
+    pending_details: list[dict[str, Any]] = []
+    for entry in load_waitlist(session):
+        row = session.get(Application, entry.application_id)
+        # Defensive: only genuinely pending applications can be queued; skip
+        # anything that has since changed state without its entry being
+        # removed.
+        if row is None or row.status != "pending":
+            continue
+        candidate = to_license(row)
+        conflicts = adjudication.evaluate(candidate, effective, guard_band)
+        if conflicts:
+            # Still blocked: keep the queue entry and carry on with the rest.
+            pending_details.append(
+                {
+                    "application_id": row.id,
+                    "conflicts": [
+                        serialize_conflict(c, guard_band) for c in conflicts
+                    ],
+                }
+            )
+            continue
+
+        # Passes now: approve immediately, one more revision, same band.
+        meta.revision += 1
+        session.add(
+            ApprovalEvent(
+                revision=meta.revision,
+                application_id=row.id,
+                guard_band=guard_band,
+                auto_approved=True,
+                release_revision=release_revision,
+            )
+        )
+        row.status = "approved"
+        row.approval_revision = meta.revision
+        session.delete(entry)
+        effective.append(candidate)
+        approved.append(
+            {
+                "application_id": row.id,
+                "revision": meta.revision,
+                "guard_band": guard_band,
+                "release_revision": release_revision,
+                "application": serialize_application(row),
+            }
+        )
+
+    return {
+        "auto_approved_application_ids": [a["application_id"] for a in approved],
+        "auto_approvals": approved,
+        "remaining_waitlist_application_ids": [
+            d["application_id"] for d in pending_details
+        ],
+        "waitlist_pending": pending_details,
+        "final_revision": meta.revision,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Revision snapshots
 # --------------------------------------------------------------------------- #
 def guard_band_at(session, revision: int) -> float:
@@ -337,6 +475,11 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
             "revision": ev.revision,
             "application_id": ev.application_id,
             "guard_band": ev.guard_band,
+            # Automatic approvals from a waitlist release share the ordinary
+            # approval event stream; the flags let history restore which
+            # decisions were automatic and which release triggered them.
+            "auto_approved": bool(ev.auto_approved),
+            "release_revision": ev.release_revision,
             "created_at": iso(ev.created_at),
             # Status of this grant *as of the queried revision*.
             "status_as_of": status_as_of,
@@ -485,6 +628,10 @@ def current_revision() -> dict[str, Any]:
             for app_id in snapshot["suspended_application_ids"]
             if (app := session.get(Application, app_id)) is not None
         ]
+        waitlist_entries = [
+            serialize_waitlist_entry(session, entry, position)
+            for position, entry in enumerate(load_waitlist(session), start=1)
+        ]
     return {
         "current_revision": revision,
         "guard_band": guard_band,
@@ -492,6 +639,8 @@ def current_revision() -> dict[str, Any]:
         "effective_applications": effective_applications,
         "suspended_application_ids": snapshot["suspended_application_ids"],
         "suspended_applications": suspended_applications,
+        "waitlist_application_ids": [e["application_id"] for e in waitlist_entries],
+        "waitlist_entries": waitlist_entries,
         "approvals": snapshot["approvals"],
         "suspensions": snapshot["suspensions"],
         "resumptions": snapshot["resumptions"],
@@ -783,6 +932,15 @@ def approve_application(
                 )
                 row.status = "approved"
                 row.approval_revision = meta.revision
+                # A manually approved standby leaves the queue so it can
+                # never be auto-approved afterwards.
+                entry = (
+                    session.query(WaitlistEntry)
+                    .filter(WaitlistEntry.application_id == application_id)
+                    .one_or_none()
+                )
+                if entry is not None:
+                    session.delete(entry)
                 session.flush()
                 response = {
                     "approved": True,
@@ -1001,6 +1159,16 @@ def batch_approve_applications(payload: BatchApprovalRequest) -> dict[str, Any]:
                     )
                     row.status = "approved"
                     row.approval_revision = meta.revision
+                    # Manually approved standbys leave the queue: they must
+                    # not be auto-approved a second time during a later
+                    # release.
+                    entry = (
+                        session.query(WaitlistEntry)
+                        .filter(WaitlistEntry.application_id == row.id)
+                        .one_or_none()
+                    )
+                    if entry is not None:
+                        session.delete(entry)
                     results.append(
                         {
                             "application_id": row.id,
@@ -1079,6 +1247,7 @@ def revoke_application(
 
                 was_suspended = row.status == "suspended"
                 meta.revision += 1
+                release_revision = meta.revision
                 session.add(
                     RevocationEvent(
                         revision=meta.revision,
@@ -1087,14 +1256,24 @@ def revoke_application(
                     )
                 )
                 row.status = "revoked"
+
+                # A released license may free spectrum: re-adjudicate the
+                # standby queue in registration order, in this same
+                # transaction and revision sequence.  The revoke keeps its
+                # one revision; each automatic approval consumes the next.
+                waitlist_result = drain_waitlist(
+                    session, meta, release_revision
+                )
                 session.flush()
                 response = {
                     "revoked": True,
                     "application_id": application_id,
-                    "revision": meta.revision,
+                    # The revoke's own revision (compatibility field).
+                    "revision": release_revision,
                     "previous_approval_revision": row.approval_revision,
                     "was_suspended": was_suspended,
                     "reason": payload.reason,
+                    **waitlist_result,
                 }
         except IntegrityError:
             session.rollback()
@@ -1179,6 +1358,7 @@ def suspend_application(
                     )
 
                 meta.revision = current + 1
+                release_revision = meta.revision
                 session.add(
                     SuspensionEvent(
                         revision=meta.revision,
@@ -1188,14 +1368,25 @@ def suspend_application(
                 )
                 row.status = "suspended"
                 row.suspended_revision = meta.revision
+
+                # The license just left the effective set: re-adjudicate the
+                # standby queue in registration order within the same
+                # transaction and revision sequence.  The suspension keeps
+                # its one revision; every automatic approval consumes the
+                # next consecutive one.
+                waitlist_result = drain_waitlist(
+                    session, meta, release_revision
+                )
                 session.flush()
                 response = {
                     "suspended": True,
                     "application_id": application_id,
-                    "revision": meta.revision,
+                    # The suspension's own revision (compatibility field).
+                    "revision": release_revision,
                     "previous_approval_revision": row.approval_revision,
                     "reason": payload.reason,
                     "application": serialize_application(row),
+                    **waitlist_result,
                 }
         except IntegrityError:
             # Backends without row locks (SQLite in tests): a concurrent
@@ -1326,6 +1517,196 @@ def resume_application(
                 details={"current_revision": latest},
             )
     return response
+
+
+# --------------------------------------------------------------------------- #
+# Waitlist (standby queue; registration/cancellation consume no revision)
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/api/applications/{application_id}/waitlist",
+    tags=["waitlist"],
+)
+def register_waitlist(
+    application_id: int,
+    payload: WaitlistRegistrationRequest | None = None,
+) -> dict[str, Any]:
+    """Register a pending application as a standby for the busy band.
+
+    The application must exist and still be ``pending``; each application can
+    be queued at most once.  Registration consumes **no** revision and never
+    changes the application's status; the response gives the FIFO queue
+    position (1-based) and the current revision.  When a later suspension or
+    revoke releases an effective license, the queue is re-adjudicated in
+    registration order inside that transaction; a manually approved standby
+    leaves the queue first.
+    """
+    reason = payload.reason if payload is not None else ""
+    with SessionLocal() as session:
+        try:
+            with session.begin():
+                # Take the singleton lock so a concurrent suspend/revoke
+                # drain cannot race the registration; registration itself
+                # does not touch the revision number.
+                session.get(RevisionMeta, 1, with_for_update=True)
+
+                row = session.get(Application, application_id)
+                if row is None:
+                    raise APIError(
+                        E_NOT_FOUND,
+                        f"application {application_id} does not exist",
+                        status_code=404,
+                    )
+                existing = (
+                    session.query(WaitlistEntry)
+                    .filter(WaitlistEntry.application_id == application_id)
+                    .one_or_none()
+                )
+                if existing is not None:
+                    raise APIError(
+                        E_ALREADY_WAITLISTED,
+                        f"application {application_id} is already registered in "
+                        "the waitlist; the same application cannot be "
+                        "registered twice",
+                        status_code=409,
+                        details={
+                            "position": load_waitlist(session).index(existing)
+                            + 1
+                        },
+                    )
+                if row.status != "pending":
+                    raise APIError(
+                        E_NOT_PENDING,
+                        f"application {application_id} is {row.status}; only "
+                        "pending applications can be registered in the waitlist",
+                        status_code=409,
+                        details={"status": row.status},
+                    )
+
+                entry = WaitlistEntry(
+                    application_id=application_id, reason=reason
+                )
+                session.add(entry)
+                session.flush()
+                current = session.get(RevisionMeta, 1).revision
+                # Position equals the insertion sequence: every earlier entry
+                # has a smaller id, and the lock guarantees no concurrent
+                # insert.
+                position = (
+                    session.query(WaitlistEntry)
+                    .filter(WaitlistEntry.id <= entry.id)
+                    .count()
+                )
+                response = {
+                    "waitlisted": True,
+                    "application_id": application_id,
+                    "queue_position": position,
+                    "current_revision": current,
+                    "reason": reason,
+                    "registered_at": iso(entry.created_at),
+                }
+        except IntegrityError:
+            # Backends without row locks (SQLite): a concurrent registration
+            # of the same application won the unique constraint.
+            session.rollback()
+            raise APIError(
+                E_ALREADY_WAITLISTED,
+                f"application {application_id} is already registered in the "
+                "waitlist; the same application cannot be registered twice",
+                status_code=409,
+            )
+    return response
+
+
+@app.post(
+    "/api/applications/{application_id}/waitlist/cancel",
+    tags=["waitlist"],
+)
+def cancel_waitlist(application_id: int) -> dict[str, Any]:
+    """Withdraw a pending application from the standby queue.
+
+    Cancellation consumes no revision and does not change the application's
+    status (it stays ``pending``).  Unknown applications are 404; applications
+    not currently queued are 409 ``not_waitlisted``.
+    """
+    with SessionLocal() as session, session.begin():
+        session.get(RevisionMeta, 1, with_for_update=True)
+
+        row = session.get(Application, application_id)
+        if row is None:
+            raise APIError(
+                E_NOT_FOUND,
+                f"application {application_id} does not exist",
+                status_code=404,
+            )
+        entry = (
+            session.query(WaitlistEntry)
+            .filter(WaitlistEntry.application_id == application_id)
+            .one_or_none()
+        )
+        if entry is None:
+            raise APIError(
+                E_NOT_WAITLISTED,
+                f"application {application_id} is not registered in the "
+                "waitlist",
+                status_code=409,
+                details={"status": row.status},
+            )
+        session.delete(entry)
+        session.flush()
+        current = session.get(RevisionMeta, 1).revision
+        response = {
+            "cancelled": True,
+            "application_id": application_id,
+            "current_revision": current,
+            "application": serialize_application(row),
+        }
+    return response
+
+
+@app.get("/api/waitlist", tags=["waitlist"])
+def list_waitlist() -> dict[str, Any]:
+    """The whole standby queue in registration (FIFO) order."""
+    with SessionLocal() as session:
+        meta = session.get(RevisionMeta, 1)
+        entries = load_waitlist(session)
+        return {
+            "current_revision": meta.revision,
+            "queue_length": len(entries),
+            "waitlist_application_ids": [e.application_id for e in entries],
+            "entries": [
+                serialize_waitlist_entry(session, entry, position)
+                for position, entry in enumerate(entries, start=1)
+            ],
+        }
+
+
+@app.get(
+    "/api/applications/{application_id}/waitlist",
+    tags=["waitlist"],
+)
+def get_waitlist_entry(application_id: int) -> dict[str, Any]:
+    """Look up one application's standby position (404 when not queued)."""
+    with SessionLocal() as session:
+        row = session.get(Application, application_id)
+        if row is None:
+            raise APIError(
+                E_NOT_FOUND,
+                f"application {application_id} does not exist",
+                status_code=404,
+            )
+        entries = load_waitlist(session)
+        for position, entry in enumerate(entries, start=1):
+            if entry.application_id == application_id:
+                meta = session.get(RevisionMeta, 1)
+                body = serialize_waitlist_entry(session, entry, position)
+                body["current_revision"] = meta.revision
+                return body
+        raise APIError(
+            E_NOT_WAITLISTED,
+            f"application {application_id} is not registered in the waitlist",
+            status_code=404,
+            details={"status": row.status},
+        )
 
 
 # --------------------------------------------------------------------------- #

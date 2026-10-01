@@ -69,6 +69,33 @@ def _ensure_suspended_revision_column() -> None:
         )
 
 
+def _ensure_approval_event_waitlist_columns() -> None:
+    """Add waitlist-era columns to ``approval_events`` on older databases.
+
+    ``auto_approved`` marks approvals granted automatically while draining
+    the standby queue on a suspend/revoke; ``release_revision`` records which
+    release revision triggered that auto approval.  Both are added
+    idempotently; historical manual approvals start as ``0`` / NULL.
+    """
+    inspector = inspect(engine)
+    columns = {col["name"] for col in inspector.get_columns("approval_events")}
+    with engine.begin() as conn:
+        if "auto_approved" not in columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE approval_events "
+                    "ADD COLUMN auto_approved BOOLEAN NOT NULL DEFAULT FALSE"
+                )
+            )
+        if "release_revision" not in columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE approval_events "
+                    "ADD COLUMN release_revision INTEGER"
+                )
+            )
+
+
 def init_db() -> None:
     """Create tables and seed the singleton revision row (revision 0).
 
@@ -84,6 +111,7 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _ensure_guard_band_column()
     _ensure_suspended_revision_column()
+    _ensure_approval_event_waitlist_columns()
     with SessionLocal() as session, session.begin():
         meta = session.get(RevisionMeta, 1)
         if meta is None:

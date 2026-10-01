@@ -15,6 +15,10 @@ not by Pydantic.
 
 ``AvailableRangesRequest`` carries the closed interval of candidate band
 lower bounds for the available-ranges search (a non-mutating query).
+
+``WaitlistRegistrationRequest`` is the optional body (``{"reason": ...}``)
+when registering a pending application into the FIFO standby queue; the
+waitlist cancel endpoint takes no body.
 """
 from __future__ import annotations
 
@@ -105,3 +109,9 @@ class AvailableRangesRequest(BaseModel):
     # checks run in semantic_validation so they use the standard envelope.
     candidate_low_min: float
     candidate_low_max: float
+
+
+class WaitlistRegistrationRequest(BaseModel):
+    # Register a pending application into the FIFO standby queue while the
+    # band is busy.  The body is optional; ``reason`` is purely informational.
+    reason: str = Field(default="", max_length=2000)

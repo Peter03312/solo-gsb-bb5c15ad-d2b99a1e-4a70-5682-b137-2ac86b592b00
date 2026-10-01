@@ -30,6 +30,16 @@
   （带宽、有效集合、修订号均不变）；通过只产生**一个**修订号，后续预览与批准统一
   使用新带宽。历史修订查询可还原当时带宽与有效集合，已有批准记录保存的裁决带宽
   不被追改，重启不覆盖已生效设置
+- **候补队列（活动频段暂被占用）**：运营人员可把**待审**申请登记为候补（FIFO），
+  并查询或取消候补；同一申请不得重复登记，申请不存在或不是待审状态一律拒绝；
+  取消候补**不改变申请状态**。登记与取消**不占修订号**，登记返回排队顺序与当前
+  修订号。已生效许可被**暂停或撤销**后，在该操作的**同一事务与同一修订号仲裁**内
+  按登记先后、用**当前保护带宽**逐项重裁候补：可通过者即时批准并立即加入有效集合
+  （占用后续连续修订号），仍有干扰者保留候补并继续检查后续申请。**手动批准**（单笔
+  或整组）会先退队，手动批准者不得再次自动批准。暂停/撤销本身仍只占原有的**一个**
+  修订号，响应列出本次自动获批与仍候补的申请 ID、未获批的冲突明细及最终修订号；
+  释放失败或事务回滚时队列、许可与修订号均不变。历史按各修订号逐项还原自动审批
+  结果（标记 `auto_approved` 与触发它的释放修订号）
 
 ---
 
@@ -76,7 +86,7 @@ export GUARD_BAND="2.0"
 uvicorn app.main:app --reload
 ```
 
-运行测试（自动使用临时 SQLite 库，共 97 个用例）：
+运行测试（自动使用临时 SQLite 库，共 124 个用例）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -165,6 +175,61 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
   恢复事件保存本次裁决带宽快照，**原批准事件不追改**。历史修订查询按批准→暂停→
   恢复→撤销的完整时间线还原各修订的有效集合与暂停集合。
 
+### 候补队列：频段暂被占用时的待审申请排队
+
+活动频段暂被占用、待审申请因干扰无法立刻批准时，运营人员可把它**登记为候补**，
+由系统在后续释放发生时按登记先后自动重裁。
+
+**登记 / 查询 / 取消（均不占修订号）**
+
+- `POST /api/applications/{id}/waitlist`，请求体可省略或为 `{"reason": "可选"}`：
+  申请必须**存在且仍为待审批（pending）**，同一申请不得重复登记。成功返回
+  `waitlisted`、`queue_position`（从 1 开始的 FIFO 位置）、`current_revision`、
+  `registered_at`；申请状态保持 `pending`。
+- 查询：`GET /api/waitlist` 返回整条队列（登记先后）与当前修订号；
+  `GET /api/applications/{id}/waitlist` 返回单个申请的排队位置（未登记返回 404）。
+  `GET /api/revision/current` 也附 `waitlist_application_ids` / `waitlist_entries`。
+- 取消：`POST /api/applications/{id}/waitlist/cancel`：从队列移除，**不改变申请
+  状态**（仍为 pending）、不占修订号，返回取消时的当前修订号。取消后可重新登记。
+- 拒绝情形：未知 ID → 404 `not_found`；重复登记 → 409 `already_waitlisted`；
+  对非待审申请登记 → 409 `not_pending`；取消/查询一个未在队列中的申请 →
+  409 `not_waitlisted`（取消）或 404（单项查询）。
+
+**释放时自动重裁（暂停 / 撤销同一事务内）**
+
+已生效许可被**暂停或撤销**时，在该操作**同一事务、同一修订号锁**内，操作本身先
+占用其原有的**一个**修订号（释放修订号），随后：
+
+1. 按登记先后逐项取出候补，用**当前生效保护带宽**与“截至此刻的全部有效许可”
+   （含本次刚自动获批者）重裁——裁决规则与单笔预览完全相同；
+2. 无冲突 → **即时批准**，退出候补、加入有效集合，占用**下一个连续修订号**，
+   继续处理后续候补；
+3. 仍有干扰 → **保留候补**（位置不变），并继续检查队列中的下一项。
+
+暂停/撤销响应在**保持原有字段兼容**（`revision` 仍是该释放操作自己的修订号）的
+基础上追加：
+
+- `auto_approved_application_ids` / `auto_approvals`：本次自动获批的申请 ID（登记
+  顺序）及各自的修订号、所用保护带宽、`release_revision`（触发它的释放修订号）；
+- `remaining_waitlist_application_ids`：仍处候补的申请 ID；
+- `waitlist_pending[].conflicts`：每个未获批申请的冲突对象与触发条件（结构同单笔
+  预览）；
+- `final_revision`：本次事务结束后的最终修订号（= 释放修订号 + 自动获批数）。
+
+**其余规则**
+
+- **手动批准即退队**：单笔 `approve` 或整组 `batch-approve` 成功时，命中的候补项
+  先从队列删除，因此手动批准者**不会**在之后的释放中被再次自动批准。
+- 自动获批与普通批准写入**同一条不可变批准事件流**，仅额外标记
+  `auto_approved: true` 与 `release_revision`；按其中任一修订号查询
+  `GET /api/revision/{n}` 即可逐项还原自动审批结果（有效集合、批准记录的
+  `status_as_of`），原手动/整组批准字段保持不变。
+- **恢复（resume）与保护带宽变更不触发候补重裁**；只有暂停与撤销属于“释放”。
+- 释放失败（如暂停时修订号过期 409）或事务回滚时，队列、许可状态与修订号
+  **均不变**——不会出现部分获批。
+- 候补登记/取消虽不改修订号，但同样在单行修订号锁上排队，与释放事务串行，
+  因此登记绝不会与正在进行的自动重裁互相穿插。
+
 ### 可用调频位置查询（不改状态）
 
 `POST /api/applications/{id}/available-ranges` 为**待审批**申请寻找可用调频位置：
@@ -186,9 +251,11 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 
 ### 修订号与并发模型
 
-- 初始修订号为 **0**；每次批准、**整组批准中的每项**批准、暂停、恢复、撤销或
-  **保护带宽变更**都使修订号 +1，并追加一条不可变事件（暂停/恢复因修订号过期或
-  恢复互扰被拒绝时**不占**修订号）。
+- 初始修订号为 **0**；每次批准、**整组批准中的每项**批准、暂停、恢复、撤销、
+  **保护带宽变更**或**释放时自动获批的每个候补申请**都使修订号 +1，并追加一条
+  不可变事件（暂停/恢复因修订号过期或恢复互扰被拒绝时**不占**修订号；候补登记与
+  取消也**不占**修订号）。候补自动批准与其触发释放同处一个事务：释放操作占一个
+  修订号，每个自动获批申请占其后连续的一个修订号。
 - `POST .../preview` 返回 `current_revision`、冲突对象及每个触发条件。
 - `POST .../approve` 必须携带 `expected_revision`。服务在 PostgreSQL
   单行修订号表上 `SELECT ... FOR UPDATE` 串行化所有批准/撤销/带宽变更事务：
@@ -215,7 +282,10 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 - 历史快照额外返回 `suspended_application_ids`、`suspensions`、`resumptions`；
   批准记录的 `status_as_of` 取值为 `approved` / `suspended` / `revoked`，暂停时附
   `suspended_at_revision`，撤销时附 `revoked_at_revision`（`GET /api/revision/current`
-  还附完整的暂停中申请对象 `suspended_applications`）。
+  还附完整的暂停中申请对象 `suspended_applications`）。候补自动获批的批准记录额外
+  带 `auto_approved: true` 与 `release_revision`（触发它的暂停/撤销修订号），按其中
+  任一修订号查询即可逐项还原自动审批；当前快照另附候补队列
+  `waitlist_application_ids` / `waitlist_entries`。
 - `GET /api/revision/{n}` 还原修订号 **n 当时**的批准、暂停、恢复、撤销记录、
   **当时生效的保护带宽**及带宽变更记录（`n` 超过当前修订号返回 404）。
 
@@ -258,8 +328,12 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | `POST` | `/api/applications/batch-approve` | **整组原子批准**（预期修订号 + 非空无重复 ID 列表） |
 | `POST` | `/api/applications/{id}/suspend` | **临时停机暂停**（预期修订号；立即退出有效集合，保留原批准） |
 | `POST` | `/api/applications/{id}/resume` | **故障解除恢复**（预期修订号；按当前带宽与有效许可重新裁决） |
-| `POST` | `/api/applications/{id}/revoke` | 撤销（仅影响后续有效集合；暂停中亦可永久撤销） |
-| `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 全部事件 |
+| `POST` | `/api/applications/{id}/revoke` | 撤销（仅影响后续有效集合；暂停中亦可永久撤销；同事务按序重裁候补） |
+| `POST` | `/api/applications/{id}/waitlist` | **候补登记**（仅待审申请；不占修订号；返回排队位置与当前修订号） |
+| `POST` | `/api/applications/{id}/waitlist/cancel` | **取消候补**（不改申请状态、不占修订号） |
+| `GET` | `/api/waitlist` | 查询整条候补队列（FIFO）与当前修订号 |
+| `GET` | `/api/applications/{id}/waitlist` | 查询单个申请的候补位置 |
+| `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 候补队列 + 全部事件 |
 | `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录与当时带宽 |
 | `GET` | `/api/config/guard-band` | 当前生效带宽、初始带宽与当前修订号 |
 | `POST` | `/api/config/guard-band/preview` | 拟定带宽预览（新带宽下有效许可间的干扰对；不改状态） |
@@ -282,6 +356,8 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | 409 | `not_approved` | 对**待审批**申请暂停（只有已获批且未撤销的许可可以暂停） |
 | 409 | `already_suspended` | 对已暂停许可重复暂停（`details.suspended_at_revision` 给出暂停修订号） |
 | 409 | `not_suspended` | 对未处于暂停状态的申请执行恢复（待审批/已获批均然，`details.status` 给出当前状态） |
+| 409 | `already_waitlisted` | 把同一申请**重复登记**为候补（`details.position` 给出当前位置） |
+| 409 | `not_waitlisted` | 取消一个**不在候补队列中**的申请（`details.status` 给出当前状态）；单项查询未登记申请时同码返回 **404** |
 | 409 | `stale_revision` | 修订号过期或被并发批准/暂停/恢复/撤销/带宽变更抢占（单笔/整组/暂停/恢复/带宽变更共享裁决） |
 | 409 | `interference` | 重新裁决发现干扰，频段未占用（整组时 `details.applications[].conflicts` 用 `scope` 区分 `effective`/`group`）；或拟定带宽会使当前有效许可对互扰，带宽未变更（`details.interfering_pairs` 附许可对与触发条件）；或**恢复暂停许可时与当前有效许可互扰**，许可保持暂停（`details.conflicts` 附冲突对象，与单笔批准同构） |
 
@@ -682,8 +758,8 @@ curl -i -X POST http://localhost:8000/api/applications/2/available-ranges \
 ```
 
 脚本版走查：[`examples/walkthrough.sh`](examples/walkthrough.sh)
-（`./examples/walkthrough.sh http://localhost:8000`），其中第 26–31 步即
-暂停 / 恢复完整走查。
+（`./examples/walkthrough.sh http://localhost:8000`），其中第 26–31 步为
+暂停 / 恢复完整走查、第 32–37 步为候补队列完整走查。
 
 ### 6.16 临时停机：暂停 → 期间另批新许可 → 恢复互扰 → 撤销新许可 → 恢复
 
@@ -808,6 +884,113 @@ curl -s http://localhost:8000/api/revision/5
 #  "approvals": [{"revision": 1, "status_as_of": "approved", ...}], ...}
 ```
 
+### 6.17 候补队列：登记 → 撤销释放 → 自动重裁 → 历史逐项还原
+
+设保护带宽 **2 MHz**、修订号为 1，有效许可 A `[100,110]`（修订号 1 获批）。待审
+申请 B `[105,108]`、C `[106,109]`、D `[200,210]` 同地同时段。
+
+**第 1 步：登记候补（不占修订号，返回排队顺序与当前修订号）**
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/2/waitlist \
+  -H 'Content-Type: application/json' -d '{"reason": "band busy"}'
+# {"waitlisted": true, "application_id": 2, "queue_position": 1,
+#  "current_revision": 1, "reason": "band busy", "registered_at": "..."}
+curl -s -X POST http://localhost:8000/api/applications/3/waitlist \
+  -H 'Content-Type: application/json' -d '{}'
+# {"waitlisted": true, "application_id": 3, "queue_position": 2, "current_revision": 1, ...}
+curl -s -X POST http://localhost:8000/api/applications/4/waitlist \
+  -H 'Content-Type: application/json' -d '{}'
+# queue_position 3；当前修订号仍是 1（登记不占修订号）
+```
+
+重复登记、对非待审申请登记均被拒绝；可查询整条队列或取消：
+
+```bash
+curl -i -X POST http://localhost:8000/api/applications/2/waitlist \
+  -H 'Content-Type: application/json' -d '{}'
+# HTTP 409 {"error": {"code": "already_waitlisted", "details": {"position": 1}}}
+curl -s http://localhost:8000/api/waitlist
+# {"current_revision": 1, "queue_length": 3,
+#  "waitlist_application_ids": [2, 3, 4], "entries": [{"position": 1, ...}, ...]}
+```
+
+**第 2 步：撤销 A（释放）——同一事务内按登记先后重裁候补**
+
+A 撤销占修订号 **2**；B 随即通过 → 自动批准占修订号 **3**；C 与刚获批的 B
+频段相交 → 保留候补，继续检查；D 通过 → 自动批准占修订号 **4**：
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/1/revoke \
+  -H 'Content-Type: application/json' -d '{"reason": "event cancelled"}'
+```
+
+```json
+{"revoked": true, "revision": 2, "final_revision": 4,
+ "auto_approved_application_ids": [2, 4],
+ "auto_approvals": [
+   {"application_id": 2, "revision": 3, "guard_band": 2.0, "release_revision": 2},
+   {"application_id": 4, "revision": 4, "guard_band": 2.0, "release_revision": 2}],
+ "remaining_waitlist_application_ids": [3],
+ "waitlist_pending": [
+   {"application_id": 3, "conflicts": [
+     {"application": {"id": 2}, "reason": "frequency_intersection", "trigger": {}}]}]}
+```
+
+暂停释放（`.../suspend`）的响应结构完全相同（`revision` 为暂停自己的修订号，
+另附 `suspended: true` 与原批准修订号）。
+
+**第 3 步：未获批者保留候补，下次释放再裁；手动批准者先退队**
+
+```bash
+# C 仍在队首；撤销 B（修订号 5）后 C 通过 -> 自动批准修订号 6
+curl -s -X POST http://localhost:8000/api/applications/2/revoke \
+  -H 'Content-Type: application/json' -d '{}'
+# {"revoked": true, "revision": 5, "final_revision": 6,
+#  "auto_approved_application_ids": [3], "remaining_waitlist_application_ids": []}
+
+# 对某候补先行手动批准（单笔或整组）时，它立即退队，之后的释放不会再自动批准它；
+# GET /api/waitlist 中不再包含该 ID。
+```
+
+**第 4 步：取消候补不改申请状态、不占修订号**
+
+```bash
+curl -s -X POST http://localhost:8000/api/applications/3/waitlist/cancel
+# {"cancelled": true, "application_id": 3, "current_revision": 1,
+#  "application": {"id": 3, "status": "pending"}}   <- 仍是 pending，修订号不变
+```
+
+**第 5 步：释放失败时一切不变；恢复 / 带宽变更不触发重裁**
+
+```bash
+# 暂停时携带过期修订号 -> 409，队列、许可、修订号均不变（同事务回滚）
+curl -i -X POST http://localhost:8000/api/applications/1/suspend \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 0}'
+# HTTP 409 {"error": {"code": "stale_revision",
+#   "details": {"expected_revision": 0, "current_revision": 1}}}
+
+# resume 与 guard-band 确认即便成功也不触发候补重裁，队列原样保留。
+```
+
+**第 6 步：历史按修订号逐项还原自动审批**
+
+```bash
+curl -s http://localhost:8000/api/revision/2
+# 释放修订号当时：effective_application_ids 为 []，revocations 含 A；尚无自动批准
+curl -s http://localhost:8000/api/revision/3
+# {"revision": 3, "effective_application_ids": [2],
+#  "approvals": [{"revision": 3, "application_id": 2,
+#                 "auto_approved": true, "release_revision": 2,
+#                 "status_as_of": "approved", ...}, ...]}
+curl -s http://localhost:8000/api/revision/4
+# effective_application_ids 为 [2, 4]；3 仍 pending 且在候补队列中
+```
+
+脚本版走查：[`examples/walkthrough.sh`](examples/walkthrough.sh)
+（`./examples/walkthrough.sh http://localhost:8000`），其中第 26–31 步为
+暂停 / 恢复走查、第 32–37 步为候补队列完整走查。
+
 ---
 
 ## 7. 项目结构
@@ -815,15 +998,15 @@ curl -s http://localhost:8000/api/revision/5
 ```
 .
 ├── app/
-│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、暂停/恢复、带宽在线配置与可用位置查询）
+│   ├── main.py                 # FastAPI 路由、序列化、并发/快照逻辑（含整组批准、暂停/恢复、带宽在线配置、可用位置查询与候补队列/释放自动重裁）
 │   ├── adjudication.py         # 纯函数：圆/时段/频段/保护带宽裁决（含组内两两、有效集成对检查与可用下界区间求解）
 │   ├── semantic_validation.py  # 整笔拒收的跨字段语义校验（含拟定带宽与候选下界区间校验）
-│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、Suspension/ResumptionRequest、GuardBand*Request、AvailableRangesRequest）
-│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽事件 + 修订号/当前带宽）
-│   ├── db.py                   # 引擎、等待数据库、建表、修订号与带宽初值初始化（重启不覆盖）
+│   ├── schemas.py              # Pydantic 请求模型（含 BatchApprovalRequest、Suspension/ResumptionRequest、GuardBand*Request、AvailableRangesRequest、WaitlistRegistrationRequest）
+│   ├── models.py               # SQLAlchemy 表（申请 + 批准/暂停/恢复/撤销/带宽事件 + 候补队列 + 修订号/当前带宽）
+│   ├── db.py                   # 引擎、等待数据库、建表与旧库列升级、修订号与带宽初值初始化（重启不覆盖）
 │   ├── config.py               # 环境变量配置（GUARD_BAND 仅作建库初值）
 │   └── errors.py               # 统一错误信封
-├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite）
+├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例）
 ├── examples/walkthrough.sh     # curl 走查脚本
 ├── Dockerfile
 ├── docker-compose.yml          # db + api 一键启动

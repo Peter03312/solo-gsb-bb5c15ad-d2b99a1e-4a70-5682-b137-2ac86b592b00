@@ -4,7 +4,10 @@ History is event-sourced:
 
 * ``applications``       - every submitted request, rejected submissions are
                            never persisted (see whole-request validation);
-* ``approval_events``    - append-only approval record, one per revision;
+* ``approval_events``    - append-only approval record, one per revision
+                           (``auto_approved``/``release_revision`` mark
+                           approvals granted automatically from the waitlist
+                           during a suspend/revoke release);
 * ``suspension_events``  - append-only record of a temporary outage: an
                            approved license is taken out of the effective set,
                            one per revision;
@@ -17,6 +20,10 @@ History is event-sourced:
                            (revision 0 is the initial value seeded at database
                            creation, every later row is one confirmed online
                            change);
+* ``waitlist_entries``    - FIFO queue of pending applications registered as
+                           standbys while the band is busy; registration and
+                           cancellation consume no revision and the entry is
+                           removed on approval (manual or automatic);
 * ``revision_meta``      - singleton row holding the current revision number
                            and the guard band currently in force.
 
@@ -33,6 +40,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -99,6 +107,20 @@ class ApprovalEvent(Base):
     )
     # Snapshot of the guard band in force when the decision was made.
     guard_band: Mapped[float] = mapped_column(Float, nullable=False)
+    # True when the approval was granted automatically from the waitlist
+    # while a suspension/revoke transaction was draining the queue.  Manual
+    # approvals leave this false; original approval events are otherwise
+    # identical and never rewritten.
+    auto_approved: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    # For an auto approval: the single revision consumed by the suspend/
+    # revoke release that triggered the queue drain (NULL for manual and
+    # batch approvals).  Lets historical snapshots restore which automatic
+    # decision each revision belonged to.
+    release_revision: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -189,6 +211,34 @@ class GuardBandEvent(Base):
         Float, nullable=True
     )
     guard_band: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class WaitlistEntry(Base):
+    """A pending application registered as a standby (FIFO queue).
+
+    Only ``pending`` applications can be queued and each application can be
+    queued at most once (unique constraint).  Registration and cancellation
+    consume **no** revision: the queue is ordered strictly by insertion (the
+    primary key doubles as the queue sequence number).  A successful manual
+    or batch approval removes the entry (a manually approved application must
+    never be auto-approved afterwards).  A suspension or revoke that releases
+    an effective license drains the queue in registration order inside the
+    same transaction: entries that pass re-adjudication under the live guard
+    band are approved automatically, the rest keep their place and the drain
+    continues with the following entries.
+    """
+
+    __tablename__ = "waitlist_entries"
+
+    # Monotonic queue sequence: registration order is the primary key order.
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False, unique=True
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )

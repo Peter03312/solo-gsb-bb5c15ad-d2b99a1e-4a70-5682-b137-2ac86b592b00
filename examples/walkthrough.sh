@@ -197,3 +197,40 @@ post "/api/applications/$C_ID/suspend" '{"expected_revision":11}' >/dev/null
 post "/api/applications/$C_ID/suspend" '{"expected_revision":12}' | J || true
 post "/api/applications/$C_ID/resume" '{"expected_revision":12}' >/dev/null
 curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision =", d["current_revision"], "(the rejections consumed none)")'
+
+echo "== 32. waitlist: register pending apps while the band is busy (no revision used) =="
+echo "    effective in the 13:00-18:00 window: C [200,210], D [300,310], E [400,410]; guard band is 1.0"
+X=$(mk "Standby X" 205 215); X_ID=$(echo "$X" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+Y=$(mk "Standby Y" 213 220); Y_ID=$(echo "$Y" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+Z=$(mk "Standby Z" 550 560); Z_ID=$(echo "$Z" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$X_ID/waitlist" '{"reason":"band busy"}' | J
+post "/api/applications/$Y_ID/waitlist" | J
+post "/api/applications/$Z_ID/waitlist" | J
+echo "ids: X=$X_ID Y=$Y_ID Z=$Z_ID"
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision is still", d["current_revision"], "; queue =", d["waitlist_application_ids"])'
+
+echo "== 33. duplicate / non-pending registration, lookup and cancel =="
+post "/api/applications/$X_ID/waitlist" '{}' | J || true
+post "/api/applications/$C_ID/waitlist" '{}' | J || true
+post /api/applications/999999/waitlist '{}' | J || true
+curl -s "$BASE/api/waitlist" | J
+curl -s "$BASE/api/applications/$Y_ID/waitlist" | J
+echo "    register F and cancel again (still no revision; application stays pending):"
+post "/api/applications/$F_ID/waitlist" '{}' | J
+post "/api/applications/$F_ID/waitlist/cancel" | J
+curl -s "$BASE/api/applications/$F_ID" | python3 -c 'import json,sys; print("F status =", json.load(sys.stdin)["status"])'
+
+echo "== 34. suspend C (revision 14) releases the band: queue drains in order =="
+echo "    X [205,215] passes -> auto rev 15; Y [213,220] clashes with the just-approved X -> stays; Z [550,560] passes -> auto rev 16"
+post "/api/applications/$C_ID/suspend" '{"expected_revision":13,"reason":"re-tune for standbys"}' | J
+
+echo "== 35. history restores each automatic approval revision by revision =="
+curl -s "$BASE/api/revision/15" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("rev 15: effective =", d["effective_application_ids"]); print("        autos =", [(a["application_id"], a["auto_approved"], a["release_revision"]) for a in d["approvals"]])'
+curl -s "$BASE/api/revision/16" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("rev 16: effective =", d["effective_application_ids"], "suspended =", d["suspended_application_ids"])'
+
+echo "== 36. revoke X (revision 17) releases again: Y now passes -> auto rev 18 =="
+post "/api/applications/$X_ID/revoke" '{"reason":"moved away"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print({k: d[k] for k in ("revision","auto_approved_application_ids","remaining_waitlist_application_ids","final_revision")})'
+
+echo "== 37. resume C (revision 19): ordinary resume, never drains a queue =="
+post "/api/applications/$C_ID/resume" '{"expected_revision":18,"reason":"fault cleared"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("resumed revision", d["revision"], "; waitlist keys present:", "auto_approved_application_ids" in d)'
+curl -s "$BASE/api/waitlist" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("queue is now", d["waitlist_application_ids"], "at revision", d["current_revision"])'
