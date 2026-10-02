@@ -197,3 +197,61 @@ post "/api/applications/$C_ID/suspend" '{"expected_revision":11}' >/dev/null
 post "/api/applications/$C_ID/suspend" '{"expected_revision":12}' | J || true
 post "/api/applications/$C_ID/resume" '{"expected_revision":12}' >/dev/null
 curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision =", d["current_revision"], "(the rejections consumed none)")'
+
+# --- waitlist walkthrough (isolated 20:00-22:00 window; guard band is 1.0) ---
+mkw() { post /api/applications "{
+  \"name\":\"$1\",
+  \"circle\":{\"cx\":0,\"cy\":0,\"radius\":1000},
+  \"frequency\":{\"low\":$2,\"high\":$3},
+  \"time_window\":{\"start\":\"2026-10-01T20:00:00Z\",\"end\":\"2026-10-01T22:00:00Z\"}
+}"; }
+
+echo "== 32. approve holder J [700,710] (revision 14); queue K, M, L behind it =="
+J=$(mkw "Holder J" 700 710); J_ID=$(echo "$J" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$J_ID/approve" '{"expected_revision":13}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("J approved at revision", d["revision"])'
+K=$(mkw "Wait K" 705 706);  K_ID=$(echo "$K" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+M=$(mkw "Wait M" 705.5 707); M_ID=$(echo "$M" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+L=$(mkw "Wait L" 720 721);  L_ID=$(echo "$L" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$K_ID/waitlist" '{"reason":"band busy"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("K queued at position", d["queue_position"], "current_revision", d["current_revision"])'
+post "/api/applications/$M_ID/waitlist" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("M queued at position", d["queue_position"])'
+post "/api/applications/$L_ID/waitlist" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("L queued at position", d["queue_position"])'
+curl -s "$BASE/api/waitlist" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("queue:", [(e["application_id"], e["queue_position"]) for e in d["waitlist"]])'
+
+echo "== 33. duplicate / non-pending / unknown registrations are refused (no revision) =="
+post "/api/applications/$K_ID/waitlist" | J || true
+post "/api/applications/$J_ID/waitlist" | J || true
+post /api/applications/999999/waitlist | J || true
+
+echo "== 34. register N then cancel it: application stays pending, no revision consumed =="
+N=$(mkw "Wait N" 800 801); N_ID=$(echo "$N" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$N_ID/waitlist" >/dev/null
+post "/api/applications/$N_ID/waitlist/cancel" '{"reason":"operator cancelled"}' | J
+post "/api/applications/$N_ID/waitlist/cancel" | J || true
+echo "    N status is still: $(curl -s "$BASE/api/applications/$N_ID" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')"
+
+echo "== 35. revoke J (revision 15): drain K, M, L in one transaction =="
+echo "    K [705,706] passes (auto rev 16); M [705.5,707] then clashes with K and stays; L [720,721] still gets checked and passes (auto rev 17)"
+post "/api/applications/$J_ID/revoke" '{"reason":"spectrum released"}' | J
+
+echo "== 36. history restores the automatic approvals revision by revision =="
+curl -s "$BASE/api/revision/15" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("rev 15: effective =", d["effective_application_ids"])'
+curl -s "$BASE/api/revision/16" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("rev 16: effective =", d["effective_application_ids"], "; K approval auto =", [(a["application_id"], a["auto_approved"], a["trigger_revision"]) for a in d["approvals"] if a["application_id"]=='"$K_ID"'])'
+curl -s "$BASE/api/revision/17" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("rev 17: effective =", d["effective_application_ids"], "(M is not among them)")'
+curl -s "$BASE/api/waitlist" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("queue now:", [(e["application_id"], e["queue_position"]) for e in d["waitlist"]])'
+
+echo "== 37. revoke K (revision 18): M now fits and is auto-approved (revision 19) =="
+post "/api/applications/$K_ID/revoke" '{"reason":"clearing the blocker"}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("final revision", d["revision"], "; auto approved:", [(x["application_id"], x["revision"]) for x in d["waitlist"]["auto_approvals"]], "; still waiting:", [x["application_id"] for x in d["waitlist"]["still_waiting"]])'
+
+echo "== 38. suspension drains the queue the same way: approve P, queue Q, suspend P =="
+P=$(mkw "Holder P" 900 910); P_ID=$(echo "$P" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+Q=$(mkw "Wait Q" 905 906);  Q_ID=$(echo "$Q" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+post "/api/applications/$P_ID/approve" '{"expected_revision":19}' >/dev/null
+post "/api/applications/$Q_ID/waitlist" >/dev/null
+post "/api/applications/$P_ID/suspend" '{"expected_revision":20,"reason":"releasing for the waitlist"}' \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("suspension revision", d["revision"], "final revision", d["final_revision"], "; auto approved:", [(x["application_id"], x["revision"], x["trigger_kind"]) for x in d["waitlist"]["auto_approvals"]])'
+
+echo "== 39. a stale release leaves queue, licenses and revisions untouched =="
+# current revision is 22; suspending effective L with expected revision 1
+# loses stale_revision: L stays effective, nothing is drained, revision stays 22
+post "/api/applications/$L_ID/suspend" '{"expected_revision":1}' | J || true
+curl -s "$BASE/api/revision/current" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("current_revision =", d["current_revision"], "; L still effective:", int("'"$L_ID"'") in d["effective_application_ids"])'

@@ -17,6 +17,11 @@ History is event-sourced:
                            (revision 0 is the initial value seeded at database
                            creation, every later row is one confirmed online
                            change);
+* ``waitlist_entries``    - one row per application ever waitlisted: a pending
+                           application queued because the band was busy.
+                           Registering/cancelling consumes NO revision; the
+                           row is reused if the same application is queued
+                           again after a cancellation;
 * ``revision_meta``      - singleton row holding the current revision number
                            and the guard band currently in force.
 
@@ -33,6 +38,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -99,6 +105,17 @@ class ApprovalEvent(Base):
     )
     # Snapshot of the guard band in force when the decision was made.
     guard_band: Mapped[float] = mapped_column(Float, nullable=False)
+    # True when the approval was granted automatically while draining the
+    # waitlist inside a suspend/revoke transaction; False for an ordinary
+    # manual single or batch approval.  False on rows created before
+    # waitlisting existed (backfilled at startup).
+    auto_approved: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    # For an automatic approval, the revision of the suspend/revoke that
+    # triggered the waitlist re-adjudication (the release event's own
+    # revision); NULL for manual approvals and legacy rows.
+    trigger_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -191,6 +208,59 @@ class GuardBandEvent(Base):
     guard_band: Mapped[float] = mapped_column(Float, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class WaitlistEntry(Base):
+    """Waitlist queue for pending applications blocked by a busy band.
+
+    Exactly one row exists per application ever queued: registering again
+    after a cancellation reactivates the same row with a new position, so
+    the unique constraint on ``application_id`` prevents any duplicate
+    active (or historical) registration.  Registration and cancellation
+    consume NO revisions and never change the application's own ``pending``
+    status.
+
+    ``position`` is a strictly increasing ordering key (new registrations
+    get ``max(position) + 1``); the public queue order is the dense 1-based
+    rank among rows with ``status == "active"`` ordered by position, so
+    cancelled holes close up.  Entries of applications that leave the
+    pending state any other way (manual approval, batch approval) are
+    deactivated the same way, with a distinct ``status`` value so they can
+    never be auto-approved.
+    """
+
+    __tablename__ = "waitlist_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    application_id: Mapped[int] = mapped_column(
+        ForeignKey("applications.id"), nullable=False, unique=True
+    )
+    # Monotonic ordering key of the (latest) registration.
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Revision current when (re-)registered; returned by the register call.
+    registered_at_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    # active            - still queued, application still pending;
+    # cancelled         - operator cancelled via the cancel endpoint;
+    # dequeued_approved - manually approved (single/batch), never auto again.
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", server_default="active"
+    )
+    # Free-form operator note recorded at (re-)registration.
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    cancelled_reason: Mapped[str] = mapped_column(
+        Text, nullable=False, default=""
+    )
+    cancelled_at_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    registered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    cancelled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_waitlist_entries_status_position", "status", "position"),
     )
 
 

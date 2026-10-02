@@ -105,3 +105,16 @@ class AvailableRangesRequest(BaseModel):
     # checks run in semantic_validation so they use the standard envelope.
     candidate_low_min: float
     candidate_low_max: float
+
+
+class WaitlistRegistrationRequest(BaseModel):
+    # Registering a pending application as a waitlist candidate consumes no
+    # revision; the body is optional.  The free-form reason is stored with
+    # the active registration purely for operator bookkeeping.
+    reason: str = Field(default="", max_length=2000)
+
+
+class WaitlistCancellationRequest(BaseModel):
+    # Cancelling a waitlist entry consumes no revision and never changes the
+    # application's own (pending) status; the body is optional.
+    reason: str = Field(default="", max_length=2000)
